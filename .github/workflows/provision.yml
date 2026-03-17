@@ -1,0 +1,369 @@
+name: Provision Infrastructure
+
+on:
+  repository_dispatch:
+    types:
+      - provision-infra
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    env:
+      ORG: ${{ vars.ORG_NAME }}
+      PROJECT_NAME: ${{ github.event.client_payload.project_name }}
+      REGION: ${{ github.event.client_payload.region }}
+    steps:
+      - name: Checkout orchestrator repo
+        uses: actions/checkout@v4
+        with:
+          path: orchestrator
+
+      - name: Install Python dependencies
+        run: pip install pyyaml jsonschema --quiet
+
+      - name: Generate and validate infra.yaml from payload
+        run: |
+          cat > /tmp/payload.json <<'PAYLOAD_EOF'
+          ${{ toJSON(github.event.client_payload) }}
+          PAYLOAD_EOF
+
+          python3 <<'PYTHON_EOF'
+          import json
+          import sys
+          import yaml
+
+          with open("/tmp/payload.json", "r", encoding="utf-8") as handle:
+              payload = json.load(handle)
+
+          if not isinstance(payload, dict):
+              print("Invalid dispatch payload: expected a JSON object.", file=sys.stderr)
+              raise SystemExit(1)
+
+          required_keys = ("project_name", "region", "team", "services")
+          missing_keys = [key for key in required_keys if key not in payload]
+          if missing_keys:
+              missing = ", ".join(missing_keys)
+              print(
+                  f"Invalid dispatch payload: missing required keys: {missing}",
+                  file=sys.stderr,
+              )
+              raise SystemExit(1)
+
+          config = {
+              "version": "1",
+              "project": {
+                  "name": payload["project_name"],
+                  "region": payload["region"],
+                  "tags": {
+                      "team": payload["team"],
+                  },
+              },
+              "services": payload["services"],
+          }
+
+          with open("/tmp/infra.yaml", "w", encoding="utf-8") as handle:
+              yaml.safe_dump(config, handle, default_flow_style=False, sort_keys=False)
+          PYTHON_EOF
+
+          cat /tmp/infra.yaml
+          python3 orchestrator/scripts/validate_config.py /tmp/infra.yaml
+
+      - name: Create repo
+        env:
+          GH_TOKEN: ${{ secrets.ORG_GITHUB_TOKEN }}
+        run: |
+          TEAM=$(jq -r '.team // ""' /tmp/payload.json)
+          BODY=$(jq -n \
+            --arg name "${PROJECT_NAME}" \
+            --arg team "${TEAM}" \
+            '{
+              name: $name,
+              description: ("Auto-provisioned project for team " + $team),
+              private: true,
+              auto_init: true
+            }')
+
+          HTTP_CODE=$(curl -s -o /tmp/create-response.json -w "%{http_code}" \
+            -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/orgs/${ORG}/repos" \
+            -d "$BODY")
+
+          if [ "$HTTP_CODE" = "201" ]; then
+            echo "Repo created."
+          elif [ "$HTTP_CODE" = "422" ]; then
+            echo "Repo already exists or could not be created because of a validation conflict. Continuing."
+          else
+            echo "::error::Failed to create repo (HTTP $HTTP_CODE)"
+            cat /tmp/create-response.json
+            exit 1
+          fi
+
+          sleep 10
+
+      - name: Commit infra.yaml to new repo
+        env:
+          GH_TOKEN: ${{ secrets.ORG_GITHUB_TOKEN }}
+        run: |
+          CONTENT_BASE64=$(base64 -w 0 /tmp/infra.yaml)
+
+          EXISTING_SHA=$(curl -s \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${ORG}/${PROJECT_NAME}/contents/infra.yaml" \
+            | jq -r '.sha // empty')
+
+          if [ -n "$EXISTING_SHA" ]; then
+            BODY=$(jq -n \
+              --arg msg "Configure infrastructure via self-service form" \
+              --arg content "$CONTENT_BASE64" \
+              --arg sha "$EXISTING_SHA" \
+              '{message: $msg, content: $content, sha: $sha}')
+          else
+            BODY=$(jq -n \
+              --arg msg "Configure infrastructure via self-service form" \
+              --arg content "$CONTENT_BASE64" \
+              '{message: $msg, content: $content}')
+          fi
+
+          HTTP_CODE=$(curl -s -o /tmp/infra-upload.json -w "%{http_code}" \
+            -X PUT \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${ORG}/${PROJECT_NAME}/contents/infra.yaml" \
+            -d "$BODY")
+
+          if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ]; then
+            echo "::error::Failed to write infra.yaml (HTTP $HTTP_CODE)"
+            cat /tmp/infra-upload.json
+            exit 1
+          fi
+
+      - name: Commit README to new repo
+        env:
+          GH_TOKEN: ${{ secrets.ORG_GITHUB_TOKEN }}
+        run: |
+          README_CONTENT=$(cat <<EOF
+          # ${PROJECT_NAME}
+
+          This repository was provisioned automatically by [infra-orchestrator](https://github.com/${ORG}/infra-orchestrator).
+
+          ## Infrastructure
+
+          See the [Infrastructure Provisioned](../../issues?q=label%3Ainfrastructure) issue for resource details (ARNs, endpoints, URLs).
+
+          ## Configuration
+
+          The \`infra.yaml\` file defines the AWS services provisioned for this project. Use the [self-service form](https://${ORG}.github.io/infra-orchestrator/) to make changes.
+          EOF
+          )
+
+          CONTENT_BASE64=$(printf "%s" "$README_CONTENT" | base64 -w 0)
+
+          EXISTING_SHA=$(curl -s \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${ORG}/${PROJECT_NAME}/contents/README.md" \
+            | jq -r '.sha // empty')
+
+          if [ -n "$EXISTING_SHA" ]; then
+            BODY=$(jq -n \
+              --arg msg "Add project README" \
+              --arg content "$CONTENT_BASE64" \
+              --arg sha "$EXISTING_SHA" \
+              '{message: $msg, content: $content, sha: $sha}')
+          else
+            BODY=$(jq -n \
+              --arg msg "Add project README" \
+              --arg content "$CONTENT_BASE64" \
+              '{message: $msg, content: $content}')
+          fi
+
+          HTTP_CODE=$(curl -s -o /tmp/readme-upload.json -w "%{http_code}" \
+            -X PUT \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${ORG}/${PROJECT_NAME}/contents/README.md" \
+            -d "$BODY")
+
+          if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ]; then
+            echo "::error::Failed to write README.md (HTTP $HTTP_CODE)"
+            cat /tmp/readme-upload.json
+            exit 1
+          fi
+
+      - name: Generate Terraform configuration
+        run: |
+          python3 orchestrator/scripts/generate_terraform.py \
+            --config /tmp/infra.yaml \
+            --modules-dir orchestrator/modules \
+            --output-dir /tmp/terraform-workspace
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.PROVISIONER_ROLE_ARN }}
+          aws-region: ${{ env.REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: /tmp/terraform-workspace
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=projects/${PROJECT_NAME}/terraform.tfstate" \
+            -backend-config="region=${{ vars.TF_STATE_REGION }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}"
+
+      - name: Terraform Plan
+        working-directory: /tmp/terraform-workspace
+        run: terraform plan -out=tfplan -input=false
+
+      - name: Terraform Apply
+        working-directory: /tmp/terraform-workspace
+        run: terraform apply -auto-approve -input=false tfplan
+
+      - name: Post success to new repo
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.ORG_GITHUB_TOKEN }}
+        working-directory: /tmp/terraform-workspace
+        run: |
+          ensure_label() {
+            local label_name="$1"
+            local label_color="$2"
+            local label_description="$3"
+
+            HTTP_CODE=$(curl -s -o /tmp/label-response.json -w "%{http_code}" \
+              -X POST \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${ORG}/${PROJECT_NAME}/labels" \
+              -d "$(jq -n \
+                --arg name "$label_name" \
+                --arg color "$label_color" \
+                --arg description "$label_description" \
+                '{name: $name, color: $color, description: $description}')")
+
+            if [ "$HTTP_CODE" != "201" ] && [ "$HTTP_CODE" != "422" ]; then
+              echo "::warning::Failed to ensure label ${label_name} (HTTP $HTTP_CODE)"
+              cat /tmp/label-response.json
+            fi
+          }
+
+          ensure_label "infrastructure" "0e8a16" "Provisioning status and resource details"
+
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          terraform output -json > /tmp/tf-outputs.json
+
+          OUTPUTS=$(python3 <<'PYTHON_EOF'
+          import json
+
+          with open("/tmp/tf-outputs.json", "r", encoding="utf-8") as handle:
+              data = json.load(handle)
+
+          for key, val in sorted(data.items()):
+              raw_value = val.get("value")
+              if isinstance(raw_value, (dict, list)):
+                  rendered = json.dumps(raw_value, sort_keys=True)
+              else:
+                  rendered = str(raw_value)
+              print(f"- **{key}:** `{rendered}`")
+          PYTHON_EOF
+          )
+
+          BODY=$(cat <<EOF
+          ## Infrastructure provisioned
+
+          **Triggered by:** @${{ github.actor }}
+          **Workflow run:** [View logs](${RUN_URL})
+
+          ### Resources
+
+          ${OUTPUTS}
+
+          ---
+          _Provisioned by [infra-orchestrator](https://${ORG}.github.io/infra-orchestrator/)_
+          EOF
+          )
+
+          HTTP_CODE=$(jq -n \
+            --arg title "Infrastructure provisioned" \
+            --arg body "$BODY" \
+            '{title: $title, body: $body, labels: ["infrastructure"]}' | \
+            curl -s -o /tmp/issue-response.json -w "%{http_code}" \
+              -X POST \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${ORG}/${PROJECT_NAME}/issues" \
+              -d @-)
+
+          if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ]; then
+            echo "::warning::Failed to post success issue (HTTP $HTTP_CODE)"
+            cat /tmp/issue-response.json
+          fi
+
+      - name: Post failure to new repo
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.ORG_GITHUB_TOKEN }}
+        run: |
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${ORG}/${PROJECT_NAME}")
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            LABEL_CODE=$(curl -s -o /tmp/failure-label.json -w "%{http_code}" \
+              -X POST \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${ORG}/${PROJECT_NAME}/labels" \
+              -d '{"name":"bug","color":"d73a4a","description":"Provisioning failures"}')
+
+            if [ "$LABEL_CODE" != "201" ] && [ "$LABEL_CODE" != "422" ]; then
+              echo "::warning::Failed to ensure bug label (HTTP $LABEL_CODE)"
+              cat /tmp/failure-label.json
+            fi
+
+            LABEL_CODE=$(curl -s -o /tmp/infrastructure-label.json -w "%{http_code}" \
+              -X POST \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${ORG}/${PROJECT_NAME}/labels" \
+              -d '{"name":"infrastructure","color":"0e8a16","description":"Provisioning status and resource details"}')
+
+            if [ "$LABEL_CODE" != "201" ] && [ "$LABEL_CODE" != "422" ]; then
+              echo "::warning::Failed to ensure infrastructure label (HTTP $LABEL_CODE)"
+              cat /tmp/infrastructure-label.json
+            fi
+
+            RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            BODY="Provisioning failed. [View workflow logs](${RUN_URL})"
+
+            ISSUE_CODE=$(jq -n \
+              --arg title "Infrastructure provisioning failed" \
+              --arg body "$BODY" \
+              '{title: $title, body: $body, labels: ["infrastructure", "bug"]}' | \
+              curl -s -o /tmp/failure-issue.json -w "%{http_code}" \
+                -X POST \
+                -H "Authorization: token $GH_TOKEN" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/${ORG}/${PROJECT_NAME}/issues" \
+                -d @-)
+
+            if [ "$ISSUE_CODE" != "200" ] && [ "$ISSUE_CODE" != "201" ]; then
+              echo "::warning::Failed to post failure issue (HTTP $ISSUE_CODE)"
+              cat /tmp/failure-issue.json
+            fi
+          fi
