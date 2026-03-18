@@ -1214,7 +1214,7 @@
           const user = await userResponse.json();
 
           const membershipResponse = await fetch(
-            `https://api.github.com/orgs/${ORG}/memberships/${user.login}`,
+            "https://api.github.com/user/memberships/orgs?state=active&per_page=100",
             {
               headers: {
                 Authorization: `token ${token}`,
@@ -1227,8 +1227,19 @@
             throw new Error("membership_check_failed");
           }
 
-          const membership = await membershipResponse.json();
-          if (membership.state !== "active") {
+          const memberships = await membershipResponse.json();
+          const membership = Array.isArray(memberships)
+            ? memberships.find(
+                (item) =>
+                  item &&
+                  item.state === "active" &&
+                  item.organization &&
+                  typeof item.organization.login === "string" &&
+                  item.organization.login.toLowerCase() === ORG.toLowerCase()
+              )
+            : null;
+
+          if (!membership) {
             throw new Error("membership_inactive");
           }
 
