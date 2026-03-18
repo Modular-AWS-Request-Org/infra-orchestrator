@@ -104,7 +104,36 @@ jobs:
             exit 1
           fi
 
-          sleep 10
+          REPO_READY="false"
+          DEFAULT_BRANCH=""
+
+          for attempt in 1 2 3 4 5 6; do
+            REPO_HTTP_CODE=$(curl -s -o /tmp/repo-response.json -w "%{http_code}" \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${ORG}/${PROJECT_NAME}")
+
+            if [ "$REPO_HTTP_CODE" = "200" ]; then
+              DEFAULT_BRANCH=$(jq -r '.default_branch // empty' /tmp/repo-response.json)
+              if [ -n "$DEFAULT_BRANCH" ]; then
+                REPO_READY="true"
+                echo "DEFAULT_BRANCH=${DEFAULT_BRANCH}" >> "$GITHUB_ENV"
+                echo "Repo is ready on branch ${DEFAULT_BRANCH}."
+                break
+              fi
+            fi
+
+            if [ "$attempt" -lt 6 ]; then
+              sleep $((attempt * 5))
+            fi
+          done
+
+          if [ "$REPO_READY" != "true" ]; then
+            echo "::error::New repo is not accessible yet. GitHub may still be initializing it, or ORG_GITHUB_TOKEN cannot access newly created repos."
+            echo "::error::If ORG_GITHUB_TOKEN is a fine-grained PAT, it usually needs access to all repositories in ${ORG}, not just infra-orchestrator."
+            cat /tmp/repo-response.json
+            exit 1
+          fi
 
       - name: Commit infra.yaml to new repo
         env:
@@ -112,34 +141,60 @@ jobs:
         run: |
           CONTENT_BASE64=$(base64 -w 0 /tmp/infra.yaml)
 
-          EXISTING_SHA=$(curl -s \
+          EXISTING_HTTP_CODE=$(curl -s -o /tmp/infra-existing.json -w "%{http_code}" \
             -H "Authorization: token $GH_TOKEN" \
             -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${ORG}/${PROJECT_NAME}/contents/infra.yaml" \
-            | jq -r '.sha // empty')
+            "https://api.github.com/repos/${ORG}/${PROJECT_NAME}/contents/infra.yaml?ref=${DEFAULT_BRANCH}")
+
+          if [ "$EXISTING_HTTP_CODE" = "200" ]; then
+            EXISTING_SHA=$(jq -r '.sha // empty' /tmp/infra-existing.json)
+          elif [ "$EXISTING_HTTP_CODE" = "404" ]; then
+            EXISTING_SHA=""
+          else
+            echo "::error::Failed to check for existing infra.yaml (HTTP $EXISTING_HTTP_CODE)"
+            cat /tmp/infra-existing.json
+            exit 1
+          fi
 
           if [ -n "$EXISTING_SHA" ]; then
             BODY=$(jq -n \
               --arg msg "Configure infrastructure via self-service form" \
               --arg content "$CONTENT_BASE64" \
+              --arg branch "$DEFAULT_BRANCH" \
               --arg sha "$EXISTING_SHA" \
-              '{message: $msg, content: $content, sha: $sha}')
+              '{message: $msg, content: $content, branch: $branch, sha: $sha}')
           else
             BODY=$(jq -n \
               --arg msg "Configure infrastructure via self-service form" \
               --arg content "$CONTENT_BASE64" \
-              '{message: $msg, content: $content}')
+              --arg branch "$DEFAULT_BRANCH" \
+              '{message: $msg, content: $content, branch: $branch}')
           fi
 
-          HTTP_CODE=$(curl -s -o /tmp/infra-upload.json -w "%{http_code}" \
-            -X PUT \
-            -H "Authorization: token $GH_TOKEN" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${ORG}/${PROJECT_NAME}/contents/infra.yaml" \
-            -d "$BODY")
+          HTTP_CODE=""
+          for attempt in 1 2 3 4 5; do
+            HTTP_CODE=$(curl -s -o /tmp/infra-upload.json -w "%{http_code}" \
+              -X PUT \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${ORG}/${PROJECT_NAME}/contents/infra.yaml" \
+              -d "$BODY")
+
+            if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
+              break
+            fi
+
+            if [ "$HTTP_CODE" = "404" ] && [ "$attempt" -lt 5 ]; then
+              sleep $((attempt * 4))
+              continue
+            fi
+
+            break
+          done
 
           if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ]; then
             echo "::error::Failed to write infra.yaml (HTTP $HTTP_CODE)"
+            echo "::error::This usually means the new repo branch is not ready yet, or ORG_GITHUB_TOKEN cannot write to the newly created repo."
             cat /tmp/infra-upload.json
             exit 1
           fi
@@ -165,34 +220,60 @@ jobs:
 
           CONTENT_BASE64=$(printf "%s" "$README_CONTENT" | base64 -w 0)
 
-          EXISTING_SHA=$(curl -s \
+          EXISTING_HTTP_CODE=$(curl -s -o /tmp/readme-existing.json -w "%{http_code}" \
             -H "Authorization: token $GH_TOKEN" \
             -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${ORG}/${PROJECT_NAME}/contents/README.md" \
-            | jq -r '.sha // empty')
+            "https://api.github.com/repos/${ORG}/${PROJECT_NAME}/contents/README.md?ref=${DEFAULT_BRANCH}")
+
+          if [ "$EXISTING_HTTP_CODE" = "200" ]; then
+            EXISTING_SHA=$(jq -r '.sha // empty' /tmp/readme-existing.json)
+          elif [ "$EXISTING_HTTP_CODE" = "404" ]; then
+            EXISTING_SHA=""
+          else
+            echo "::error::Failed to check for existing README.md (HTTP $EXISTING_HTTP_CODE)"
+            cat /tmp/readme-existing.json
+            exit 1
+          fi
 
           if [ -n "$EXISTING_SHA" ]; then
             BODY=$(jq -n \
               --arg msg "Add project README" \
               --arg content "$CONTENT_BASE64" \
+              --arg branch "$DEFAULT_BRANCH" \
               --arg sha "$EXISTING_SHA" \
-              '{message: $msg, content: $content, sha: $sha}')
+              '{message: $msg, content: $content, branch: $branch, sha: $sha}')
           else
             BODY=$(jq -n \
               --arg msg "Add project README" \
               --arg content "$CONTENT_BASE64" \
-              '{message: $msg, content: $content}')
+              --arg branch "$DEFAULT_BRANCH" \
+              '{message: $msg, content: $content, branch: $branch}')
           fi
 
-          HTTP_CODE=$(curl -s -o /tmp/readme-upload.json -w "%{http_code}" \
-            -X PUT \
-            -H "Authorization: token $GH_TOKEN" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${ORG}/${PROJECT_NAME}/contents/README.md" \
-            -d "$BODY")
+          HTTP_CODE=""
+          for attempt in 1 2 3 4 5; do
+            HTTP_CODE=$(curl -s -o /tmp/readme-upload.json -w "%{http_code}" \
+              -X PUT \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${ORG}/${PROJECT_NAME}/contents/README.md" \
+              -d "$BODY")
+
+            if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
+              break
+            fi
+
+            if [ "$HTTP_CODE" = "404" ] && [ "$attempt" -lt 5 ]; then
+              sleep $((attempt * 4))
+              continue
+            fi
+
+            break
+          done
 
           if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ]; then
             echo "::error::Failed to write README.md (HTTP $HTTP_CODE)"
+            echo "::error::This usually means the new repo branch is not ready yet, or ORG_GITHUB_TOKEN cannot write to the newly created repo."
             cat /tmp/readme-upload.json
             exit 1
           fi
