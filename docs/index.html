@@ -471,7 +471,7 @@
               <h2>1. Authenticate</h2>
               <p class="section-note">
                 Enter a GitHub PAT with access to the
-                <strong>Modular-AWS-Request-Org</strong> organization. It is stored in
+                <strong>Modular-AWS-Request-Org/infra-orchestrator</strong> repository. It is stored in
                 <code>sessionStorage</code> only and is cleared when the tab closes. Production
                 would use GitHub OAuth instead.
               </p>
@@ -490,7 +490,8 @@
                 spellcheck="false"
               />
               <div class="subtle">
-                The app validates your token with GitHub and confirms your membership in the org.
+                The app validates your token with GitHub and confirms access to the
+                <code>infra-orchestrator</code> repository.
               </div>
             </div>
 
@@ -1077,7 +1078,7 @@
         const errors = [];
 
         if (state.auth.status !== "success") {
-          errors.push("Validate a GitHub PAT and confirm org membership.");
+          errors.push("Validate a GitHub PAT with access to the orchestrator repository.");
         }
 
         if (!PROJECT_NAME_PATTERN.test(state.projectName.trim())) {
@@ -1151,12 +1152,12 @@
             `Authenticated as ${name}. You can now trigger provisioning for ${ORG}.`
           );
         } else if (state.auth.status === "pending") {
-          showStatus(elements.authStatus, "info", "Validating token and checking org membership...");
+          showStatus(elements.authStatus, "info", "Validating token and checking repository access...");
         } else if (state.auth.status === "error") {
           showStatus(
             elements.authStatus,
             "error",
-            state.auth.message || "Authentication failed. Enter a valid PAT with org access."
+            state.auth.message || "Authentication failed. Enter a valid PAT with repository access."
           );
         } else {
           hideStatus(elements.authStatus);
@@ -1213,8 +1214,8 @@
 
           const user = await userResponse.json();
 
-          const membershipResponse = await fetch(
-            "https://api.github.com/user/memberships/orgs?state=active&per_page=100",
+          const repoResponse = await fetch(
+            `https://api.github.com/repos/${ORG}/${ORCHESTRATOR_REPO}`,
             {
               headers: {
                 Authorization: `token ${token}`,
@@ -1223,24 +1224,8 @@
             }
           );
 
-          if (!membershipResponse.ok) {
-            throw new Error("membership_check_failed");
-          }
-
-          const memberships = await membershipResponse.json();
-          const membership = Array.isArray(memberships)
-            ? memberships.find(
-                (item) =>
-                  item &&
-                  item.state === "active" &&
-                  item.organization &&
-                  typeof item.organization.login === "string" &&
-                  item.organization.login.toLowerCase() === ORG.toLowerCase()
-              )
-            : null;
-
-          if (!membership) {
-            throw new Error("membership_inactive");
+          if (!repoResponse.ok) {
+            throw new Error("repo_access_failed");
           }
 
           sessionStorage.setItem("githubPat", token);
@@ -1258,8 +1243,8 @@
 
           if (error instanceof TypeError) {
             message = "Could not reach GitHub. Check your connection.";
-          } else if (error.message === "membership_check_failed" || error.message === "membership_inactive") {
-            message = `You do not appear to be an active member of ${ORG}.`;
+          } else if (error.message === "repo_access_failed") {
+            message = `This token cannot access ${ORG}/${ORCHESTRATOR_REPO}.`;
           }
 
           state.auth = {
